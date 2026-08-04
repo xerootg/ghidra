@@ -112,6 +112,9 @@ jobs:
       VERSION: ${{ needs.detect.outputs.version }}
       RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
       BRANCH: noprompt/${{ needs.detect.outputs.version }}
+      # The repository is checked out into tooling/, so the workspace root is
+      # not a git repository and gh cannot infer which repo it is acting on.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Check out fork tooling
         uses: actions/checkout@v6
