@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xerootg <4009802+xerootg@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 20:23:14 +0000
+Subject: [PATCH] Add 'Ask To Analyze' tool option, disabled by default
+
+Ghidra prompts 'X has not been analyzed. Would you like to analyze it
+now?' the first time a never-analyzed program is opened. Gate that
+prompt behind a new boolean tool option under Edit -> Tool Options ->
+Auto Analysis, and ship it disabled so the dialog never appears.
+
+Setting the option back to true restores stock behavior without
+rebuilding. Auto-analysis remains available from Analysis -> Auto
+Analyze (key binding 'A'), and headless/PyGhidra paths are untouched
+since they consult GhidraProgramUtilities directly.
+---
+ .../app/plugin/core/analysis/AutoAnalysisPlugin.java | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/analysis/AutoAnalysisPlugin.java b/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/analysis/AutoAnalysisPlugin.java
+index 9d34be95..c5ab84f7 100644
+--- a/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/analysis/AutoAnalysisPlugin.java
++++ b/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/analysis/AutoAnalysisPlugin.java
+@@ -64,6 +64,7 @@ import ghidra.util.task.TaskLauncher;
+ public class AutoAnalysisPlugin extends Plugin implements AutoAnalysisManagerListener {
+ 
+ 	private static final String SHOW_ANALYSIS_OPTIONS = "Show Analysis Options";
++	private static final String ASK_TO_ANALYZE = "Ask To Analyze";
+ 	private static final String ANALYZE_GROUP_NAME = "Analyze";
+ 
+ 	private DockingAction autoAnalyzeAction;
+@@ -88,6 +89,13 @@ public class AutoAnalysisPlugin extends Plugin implements AutoAnalysisManagerLis
+ 		helpLocation = new HelpLocation("AutoAnalysisPlugin", "AnalysisOptions");
+ 		options.setOptionsHelpLocation(helpLocation);
+ 		options.registerOption(SHOW_ANALYSIS_OPTIONS, true, helpLocation, description);
++
++		String askDescription = "When enabled, a dialog asking whether to run auto-analysis is" +
++			" shown the first time a program that has never been analyzed is opened. This build" +
++			" leaves the option disabled by default; enable it to restore the stock Ghidra" +
++			" behavior. Auto-analysis can always be started manually from Analysis ->" +
++			" Auto Analyze.";
++		options.registerOption(ASK_TO_ANALYZE, false, helpLocation, askDescription);
+ 	}
+ 
+ 	private void findAnalyzers() {
+@@ -279,6 +287,10 @@ public class AutoAnalysisPlugin extends Plugin implements AutoAnalysisManagerLis
+ 	}
+ 
+ 	private void postProgramActivated(Program program) {
++		Options options = tool.getOptions(GhidraOptions.CATEGORY_AUTO_ANALYSIS);
++		if (!options.getBoolean(ASK_TO_ANALYZE, false)) {
++			return;
++		}
+ 		AutoAnalysisManager analysisMgr = AutoAnalysisManager.getAnalysisManager(program);
+ 		if (analysisMgr.askToAnalyze(tool)) {
+ 			analyzeCallback(program, null);

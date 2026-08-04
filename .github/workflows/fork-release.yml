@@ -1,0 +1,309 @@
+name: Fork release
+
+# Tracks the upstream Ghidra stable release tags. For every new
+# Ghidra_<version>_build tag that appears on NationalSecurityAgency/ghidra this
+# workflow rebuilds that exact source tree with the patches in patches/, pushes
+# the patched source as a branch and tag, and publishes the resulting Linux
+# distribution as a GitHub Release on this fork.
+#
+# Nothing here touches upstream. The patched branches are recreated from the
+# upstream tag on every run, so this fork never accumulates merge history and
+# never drifts.
+
+on:
+  schedule:
+    # Daily. Upstream releases are infrequent; a no-op run costs a few seconds.
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build (blank = newest Ghidra_*_build)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if the release already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/NationalSecurityAgency/ghidra.git
+  # Ghidra derives its install directory name and its per-user settings
+  # directory (~/.ghidra/.ghidra_<version>_<release name>) from this. Building
+  # from a release tag would yield "DEV"; using the same value upstream ships
+  # keeps this build drop-in compatible with an official install, so existing
+  # tools, key bindings and projects carry over.
+  RELEASE_NAME: PUBLIC
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+      release_tag: ${{ steps.pick.outputs.release_tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Pick upstream release tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_TAG}" ]; then
+            tag="${INPUT_TAG}"
+          else
+            # Sort on the bare version only. Sorting the full tag name would
+            # rank Ghidra_12.1_build above Ghidra_12.1.2_build, because "_build"
+            # compares after ".2_build" under version sort.
+            version="$(git ls-remote --tags --refs "$UPSTREAM_URL" 'Ghidra_*_build' \
+              | sed -n 's#.*refs/tags/Ghidra_\(.*\)_build$#\1#p' \
+              | sort -V | tail -1)"
+            if [ -z "$version" ]; then
+              echo "::error::could not enumerate upstream release tags"
+              exit 1
+            fi
+            tag="Ghidra_${version}_build"
+          fi
+
+          version="${tag#Ghidra_}"
+          version="${version%_build}"
+          release_tag="${tag}-noprompt"
+
+          build=true
+          if [ "${FORCE}" != "true" ] \
+             && gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $release_tag already published; nothing to do."
+            build=false
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "release_tag=$release_tag"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Upstream tag \`$tag\`"
+            echo
+            echo "- version: \`$version\`"
+            echo "- release tag: \`$release_tag\`"
+            echo "- build needed: \`$build\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
+      VERSION: ${{ needs.detect.outputs.version }}
+      RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+      BRANCH: noprompt/${{ needs.detect.outputs.version }}
+    steps:
+      - name: Check out fork tooling
+        uses: actions/checkout@v6
+        with:
+          path: tooling
+
+      - name: Assemble patched source tree
+        run: |
+          set -euo pipefail
+
+          # Blobless clone: full commit history (needed so the push below sends
+          # only our new commits) without paying for every blob in Ghidra's
+          # history. Takes well under a minute.
+          git clone --filter=blob:none --no-checkout \
+            "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" src
+          cd src
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+          git checkout -B "$BRANCH" "refs/tags/${TAG}"
+
+          # Fork build settings, applied as a plain edit rather than a patch so
+          # they can never fail to apply against a future tag.
+          sed -i "s/^application\.release\.name=.*/application.release.name=${RELEASE_NAME}/" \
+            Ghidra/application.properties
+          # Upstream's CI runs a full build on every push, which would shadow
+          # this workflow with a duplicate 30+ minute job on each release branch.
+          rm -f .github/workflows/build-ghidra.yml \
+                .github/workflows/dependency-submission.yml
+          git commit -qam "fork: build as ${RELEASE_NAME}, drop upstream push-triggered CI"
+
+          grep '^application\.' Ghidra/application.properties
+
+      - name: Apply fork patches
+        run: |
+          set -euo pipefail
+          cd src
+          shopt -s nullglob
+          patches=(../tooling/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::no patches found in patches/"
+            exit 1
+          fi
+          for p in "${patches[@]}"; do
+            name="$(basename "$p")"
+            echo "::group::git am -3 $name"
+            if ! git am -3 "$p"; then
+              git am --show-current-patch=diff || true
+              git am --abort || true
+              echo "::endgroup::"
+              echo "::error::patch $name does not apply to ${TAG}"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          git log --oneline "refs/tags/${TAG}..HEAD"
+
+      - name: Read required JDK version
+        run: |
+          set -euo pipefail
+          jdk="$(awk -F= '$1=="application.java.min" {print $2}' src/Ghidra/application.properties)"
+          echo "Ghidra ${VERSION} requires JDK ${jdk}"
+          echo "JDK_VER=${jdk}" >> "$GITHUB_ENV"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JDK_VER }}
+
+      - name: Fetch Ghidra dependencies
+        working-directory: src
+        run: ./gradlew -I gradle/support/fetchDependencies.gradle -DhideDownloadProgress -DnoEclipse
+
+      - name: Build Ghidra
+        working-directory: src
+        run: ./gradlew buildGhidra --parallel
+
+      - name: Collect release assets
+        run: |
+          set -euo pipefail
+          ls -la src/build/dist/
+
+          shopt -s nullglob
+          zips=(src/build/dist/ghidra_"${VERSION}"_*.zip)
+          if [ ${#zips[@]} -ne 1 ]; then
+            echo "::error::expected exactly one distribution zip, found: ${zips[*]:-none}"
+            exit 1
+          fi
+
+          mkdir -p out
+          asset="ghidra_${VERSION}_${RELEASE_NAME}_noprompt_linux_x86_64.zip"
+          cp "${zips[0]}" "out/${asset}"
+
+          # The .desktop file in the Arch package needs an icon that is not
+          # buried inside a jar.
+          cp src/Ghidra/Framework/Gui/src/main/resources/images/GhidraIcon256.png \
+            out/ghidra-icon.png
+
+          ( cd out && sha256sum ./* > sha256sums.txt )
+          cat out/sha256sums.txt
+
+          zip_sha="$(awk -v f="./${asset}" '$2==f {print $1}' out/sha256sums.txt)"
+          icon_sha="$(awk '$2=="./ghidra-icon.png" {print $1}' out/sha256sums.txt)"
+
+          # Consumed by the ghidra-noprompt PKGBUILD bump job in xerootg/arch.
+          cat > out/release-metadata.json <<EOF
+          {
+            "version": "${VERSION}",
+            "upstream_tag": "${TAG}",
+            "release_tag": "${RELEASE_TAG}",
+            "release_name": "${RELEASE_NAME}",
+            "install_dir": "ghidra_${VERSION}_${RELEASE_NAME}",
+            "java_min": "${JDK_VER}",
+            "zip_asset": "${asset}",
+            "zip_sha256": "${zip_sha}",
+            "icon_asset": "ghidra-icon.png",
+            "icon_sha256": "${icon_sha}"
+          }
+          EOF
+          cat out/release-metadata.json
+
+      - name: Push patched branch and tags
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git tag -f -a "$RELEASE_TAG" -m "Ghidra ${VERSION} with fork patches applied"
+          # Push the upstream tag first so the server shares the base objects and
+          # only our two commits travel over the wire.
+          git push -f origin "refs/tags/${TAG}"
+          git push -f origin "HEAD:refs/heads/${BRANCH}"
+          git push -f origin "refs/tags/${RELEASE_TAG}"
+          git push -f origin "HEAD:refs/heads/noprompt-latest"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          cat > notes.md <<EOF
+          Ghidra ${VERSION}, built from upstream [\`${TAG}\`](https://github.com/NationalSecurityAgency/ghidra/releases/tag/${TAG}) with this fork's patches applied.
+
+          **What is different from the official build**
+
+          - Opening a program that has never been analyzed no longer pops up
+            *"... has not been analyzed. Would you like to analyze it now?"*.
+            The prompt now sits behind a tool option, **Edit → Tool Options → Auto Analysis → Ask To Analyze**, which ships disabled. Turn it on to get the stock behavior back; no rebuild needed.
+          - Auto-analysis itself is unchanged and still available from **Analysis → Auto Analyze** (key binding \`A\`). Headless and PyGhidra behavior is untouched.
+
+          Patched source: [\`${BRANCH}\`](../../tree/${BRANCH}) · exact tree: \`${RELEASE_TAG}\`
+
+          **Install**
+
+          Linux x86_64 only. Requires JDK ${JDK_VER}. Unzip and run \`ghidraRun\`.
+          The archive unpacks to \`ghidra_${VERSION}_${RELEASE_NAME}\` and uses the same
+          user settings directory as an official install of the same version.
+
+          Arch users: \`ghidra-noprompt\` in the [custom repo](https://github.com/xerootg/arch).
+          EOF
+
+          title="Ghidra ${VERSION} (no analysis prompt)"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" out/* --clobber
+            gh release edit "$RELEASE_TAG" --title "$title" --notes-file notes.md
+          else
+            gh release create "$RELEASE_TAG" out/* --title "$title" --notes-file notes.md
+          fi
+
+          {
+            echo "### Published \`$RELEASE_TAG\`"
+            echo
+            cat notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue if the release failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Fork release failed for ${TAG}"
+          existing="$(gh issue list --state open --search "$title in:title" \
+            --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+          body="[Run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) failed while producing \`${RELEASE_TAG}\` from upstream \`${TAG}\`.
+
+          If a patch in \`patches/\` no longer applies, rebase it against the new tag and re-run this workflow with \`force\` unset."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
