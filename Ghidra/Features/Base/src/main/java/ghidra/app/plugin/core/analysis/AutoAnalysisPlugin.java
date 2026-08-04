@@ -64,6 +64,7 @@ import ghidra.util.task.TaskLauncher;
 public class AutoAnalysisPlugin extends Plugin implements AutoAnalysisManagerListener {
 
 	private static final String SHOW_ANALYSIS_OPTIONS = "Show Analysis Options";
+	private static final String ASK_TO_ANALYZE = "Ask To Analyze";
 	private static final String ANALYZE_GROUP_NAME = "Analyze";
 
 	private DockingAction autoAnalyzeAction;
@@ -88,6 +89,13 @@ public class AutoAnalysisPlugin extends Plugin implements AutoAnalysisManagerLis
 		helpLocation = new HelpLocation("AutoAnalysisPlugin", "AnalysisOptions");
 		options.setOptionsHelpLocation(helpLocation);
 		options.registerOption(SHOW_ANALYSIS_OPTIONS, true, helpLocation, description);
+
+		String askDescription = "When enabled, a dialog asking whether to run auto-analysis is" +
+			" shown the first time a program that has never been analyzed is opened. This build" +
+			" leaves the option disabled by default; enable it to restore the stock Ghidra" +
+			" behavior. Auto-analysis can always be started manually from Analysis ->" +
+			" Auto Analyze.";
+		options.registerOption(ASK_TO_ANALYZE, false, helpLocation, askDescription);
 	}
 
 	private void findAnalyzers() {
@@ -279,6 +287,10 @@ public class AutoAnalysisPlugin extends Plugin implements AutoAnalysisManagerLis
 	}
 
 	private void postProgramActivated(Program program) {
+		Options options = tool.getOptions(GhidraOptions.CATEGORY_AUTO_ANALYSIS);
+		if (!options.getBoolean(ASK_TO_ANALYZE, false)) {
+			return;
+		}
 		AutoAnalysisManager analysisMgr = AutoAnalysisManager.getAnalysisManager(program);
 		if (analysisMgr.askToAnalyze(tool)) {
 			analyzeCallback(program, null);
